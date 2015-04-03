@@ -52,6 +52,9 @@ struct Port
     static int isSignallingNan(longdouble);
 
     static int isInfinity(double);
+#ifdef IN_GCC
+    static int isInfinity(longdouble);
+#endif
 
     static longdouble fmodl(longdouble x, longdouble y);
     static longdouble sqrt(longdouble x);
@@ -65,8 +68,13 @@ struct Port
     static int memicmp(const char *s1, const char *s2, int n);
     static int stricmp(const char *s1, const char *s2);
 
+#ifdef IN_GCC
+    static longdouble strtof(const char *p, char **endp);
+    static longdouble strtod(const char *p, char **endp);
+#else
     static float strtof(const char *p, char **endp);
     static double strtod(const char *p, char **endp);
+#endif
     static longdouble strtold(const char *p, char **endp);
 };
 
