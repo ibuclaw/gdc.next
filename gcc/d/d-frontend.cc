@@ -29,7 +29,9 @@ along with GCC; see the file COPYING3.  If not see
 #include "dfrontend/errors.h"
 #include "dfrontend/scope.h"
 #include "dfrontend/statement.h"
+#include "dfrontend/module.h"
 #include "dfrontend/declaration.h"
+#include "dfrontend/doc.h"
 
 #include "diagnostic.h"
 #include "tm.h"
@@ -148,6 +150,170 @@ get_linemap(const Loc loc)
   linemap_add(line_table, LC_LEAVE, 0, NULL, 0);
 
   return gcc_location;
+}
+
+/* Initialise the global structure.  */
+
+void
+d_frontend_init_options(const char *vendor, const char *argv0)
+{
+  /* Set default values.  */
+  global.init();
+
+  global.compiler.vendor = vendor;
+
+  global.params.argv0 = argv0;
+  global.params.link = true;
+  global.params.useAssert = true;
+  global.params.useInvariants = true;
+  global.params.useIn = true;
+  global.params.useOut = true;
+  global.params.useArrayBounds = 2;
+  global.params.useSwitchError = true;
+  global.params.useInline = false;
+  global.params.warnings = 0;
+  global.params.obj = true;
+  global.params.useDeprecated = 1;
+  global.params.betterC = false;
+  global.params.allInst = false;
+
+  global.params.verbose = true;
+
+  global.params.linkswitches = new Strings();
+  global.params.libfiles = new Strings();
+  global.params.objfiles = new Strings();
+  global.params.ddocfiles = new Strings();
+
+  global.params.imppath = new Strings();
+  global.params.fileImppath = new Strings();
+  global.path = new Strings();
+  global.filePath = new Strings();
+}
+
+/* Parse and semantically analyse all input files.  */
+
+void
+d_frontend_parse_file(const char **filenames, size_t num_filenames)
+{
+  /* Create Modules.  */
+  Modules modules;
+  modules.reserve(num_filenames);
+
+  for (size_t i = 0; i < num_filenames; i++)
+    {
+      /* Strip the D source file of its path and extension.  */
+      const char *p = FileName::name(filenames[i]);
+      const char *name = FileName::removeExt(p);
+
+      Identifier *id = Identifier::idPool(name);
+      Module *m = new Module(filenames[i], id,
+			     global.params.doDocComments,
+			     global.params.doHdrGeneration);
+      modules.push(m);
+    }
+
+  /* Read files.  */
+  for (size_t i = 0; i < modules.dim; i++)
+    {
+      Module *m = modules[i];
+      m->read(Loc());
+    }
+
+  /* Parse files.  */
+  for (size_t i = 0; i < modules.dim; i++)
+    {
+      Module *m = modules[i];
+
+      if (global.params.verbose)
+	fprintf(global.stdmsg, "parse     %s\n", m->toChars());
+
+      if (!Module::rootModule)
+	Module::rootModule = m;
+
+      m->importedFrom = m;
+      m->parse();
+
+      if (m->isDocFile)
+	{
+	  gendocfile(m);
+	  /* Remove m from list of modules.  */
+	  modules.remove(i);
+	  i--;
+	}
+    }
+
+  if (global.errors)
+    return;
+
+  /* Load all unconditional imports for better symbol resolving.  */
+  for (size_t i = 0; i < modules.dim; i++)
+    {
+      Module *m = modules[i];
+
+      if (global.params.verbose)
+	fprintf(global.stdmsg, "importall %s\n", m->toChars());
+
+      m->importAll(NULL);
+    }
+
+  /* Do semantic analysis.  */
+  for (size_t i = 0; i < modules.dim; i++)
+    {
+      Module *m = modules[i];
+
+      if (global.params.verbose)
+	fprintf(global.stdmsg, "semantic  %s\n", m->toChars());
+
+      m->semantic();
+    }
+
+  if (global.errors)
+    return;
+
+  /* Do deferred semantic analysis.  */
+  Module::dprogress = 1;
+  Module::runDeferredSemantic();
+
+  if (Module::deferred.dim)
+    {
+      for (size_t i = 0; i < Module::deferred.dim; i++)
+	{
+	  Dsymbol *sd = Module::deferred[i];
+	  sd->error("unable to resolve forward reference in definition");
+	}
+      return;
+    }
+
+  /* Do pass 2 semantic analysis.  */
+  for (size_t i = 0; i < modules.dim; i++)
+    {
+      Module *m = modules[i];
+
+      if (global.params.verbose)
+	fprintf(global.stdmsg, "semantic2 %s\n", m->toChars());
+
+      m->semantic2();
+    }
+
+  if (global.errors)
+    return;
+
+  /* Do pass 3 semantic analysis.  */
+  for (size_t i = 0; i < modules.dim; i++)
+    {
+      Module *m = modules[i];
+
+      if (global.params.verbose)
+	fprintf(global.stdmsg, "semantic3 %s\n", m->toChars());
+
+      m->semantic3();
+    }
+
+  Module::runDeferredSemantic3();
+
+  /* Do not attempt to generate output files if errors or warnings occurred.  */
+  if (global.errors || global.warnings)
+    return;
 }
 
 /* Routines that map front-end diagnostics to GCC.

@@ -23,6 +23,18 @@ along with GCC; see the file COPYING3.  If not see
 #include "system.h"
 #include "coretypes.h"
 
+#include "dfrontend/globals.h"
+#include "dfrontend/filename.h"
+#include "dfrontend/lexer.h"
+#include "dfrontend/target.h"
+#include "dfrontend/expression.h"
+#include "dfrontend/module.h"
+#include "dfrontend/mtype.h"
+#include "dfrontend/cond.h"
+
+#include "id.h"
+#include "d-frontend.h"
+
 #include "opts.h"
 #include "signop.h"
 #include "hash-set.h"
@@ -36,6 +48,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "inchash.h"
 #include "tree.h"
 #include "debug.h"
+#include "diagnostic.h"
 #include "langhooks.h"
 #include "langhooks-def.h"
 #include "hash-map.h"
@@ -50,6 +63,14 @@ along with GCC; see the file COPYING3.  If not see
 #include "ipa-ref.h"
 #include "dumpfile.h"
 #include "cgraph.h"
+
+/* Search prefix and multilib directories, passed by the driver.  */
+static const char *iprefix_dir = NULL;
+static const char *imultilib_dir = NULL;
+
+/* Zero disables all standard directories for modules.  */
+static bool std_inc = true;
+
 
 /* Language-dependent contents of a type.  */
 
@@ -111,12 +132,157 @@ d_langhook_init (void)
   /* This is the C main, not the D main.  */
   main_identifier_node = get_identifier ("main");
 
+  /* Initialise the frontend.  */
+  Lexer::initLexer ();
+  Type::init ();
+  Id::initialize ();
+  Module::init ();
+  Target::init ();
+  Expression::init ();
+  initPrecedence ();
+  initTraitsStringTable ();
+
+  /* Add all platform agnostic version conditions.  */
+  VersionCondition::addPredefinedGlobalIdent ("GNU");
+  VersionCondition::addPredefinedGlobalIdent ("D_Version2");
+
+  if (BYTES_BIG_ENDIAN)
+    VersionCondition::addPredefinedGlobalIdent ("BigEndian");
+  else
+    VersionCondition::addPredefinedGlobalIdent ("LittleEndian");
+
+  /* LP64 only means 64bit pointers in D. */
+  if (global.params.isLP64)
+    VersionCondition::addPredefinedGlobalIdent ("D_LP64");
+
+  /* Setting global.params.cov forces module info generation which is
+     not needed for thee GCC coverage implementation.  Instead, just
+     test flag_test_coverage while leaving global.params.cov unset. */
+  if (flag_test_coverage)
+    VersionCondition::addPredefinedGlobalIdent ("D_Coverage");
+  if (flag_pic)
+    VersionCondition::addPredefinedGlobalIdent ("D_PIC");
+  if (global.params.doDocComments)
+    VersionCondition::addPredefinedGlobalIdent ("D_Ddoc");
+  if (global.params.useUnitTests)
+    VersionCondition::addPredefinedGlobalIdent ("unittest");
+  if (global.params.useAssert)
+    VersionCondition::addPredefinedGlobalIdent("assert");
+  if (!global.params.useArrayBounds)
+    VersionCondition::addPredefinedGlobalIdent("D_NoBoundsChecks");
+
+  VersionCondition::addPredefinedGlobalIdent ("all");
+
+  /* Add all platform dependent version conditions.  */
+#ifndef TARGET_CPU_D_BUILTINS
+# define TARGET_CPU_D_BUILTINS()
+#endif
+
+#ifndef TARGET_OS_D_BUILTINS
+# define TARGET_OS_D_BUILTINS()
+#endif
+
+# define builtin_define(TXT) \
+  VersionCondition::addPredefinedGlobalIdent (TXT)
+
+  TARGET_CPU_D_BUILTINS ();
+  TARGET_OS_D_BUILTINS ();
+
+  /* Insert all library-configured and user-defined import paths.  */
+  d_frontend_add_paths (iprefix_dir, imultilib_dir, std_inc);
+
   return true;
+}
+
+/* Return language mask for option parsing.  */
+
+static unsigned int
+d_langhook_option_lang_mask (void)
+{
+  return CL_D;
+}
+
+/* Common initialization before calling option handlers.  */
+
+static void
+d_langhook_init_options (unsigned int, cl_decoded_option *decoded_options)
+{
+  d_frontend_init_options (lang_hooks.name, xstrdup (decoded_options[0].arg));
+}
+
+/* Handle D specific options.  Return false if the option is invalid.  */
+
+static bool
+d_langhook_handle_option (size_t scode, const char *arg, int value,
+			  int kind ATTRIBUTE_UNUSED,
+			  location_t loc ATTRIBUTE_UNUSED,
+			  const cl_option_handlers *handlers ATTRIBUTE_UNUSED)
+{
+  opt_code code = (opt_code) scode;
+  bool result = true;
+
+  switch (code)
+    {
+    case OPT_imultilib:
+      imultilib_dir = arg;
+      break;
+
+    case OPT_iprefix:
+      iprefix_dir = arg;
+      break;
+
+    case OPT_I:
+      global.params.imppath->push (arg);
+      break;
+
+    case OPT_J:
+      global.params.fileImppath->push (arg);
+      break;
+
+    case OPT_nostdinc:
+      std_inc = false;
+      break;
+
+    case OPT_Wall:
+      if (value)
+	global.params.warnings = 2;
+      break;
+
+    case OPT_Wdeprecated:
+      global.params.useDeprecated = value ? 2 : 1;
+      break;
+
+    case OPT_Werror:
+      if (value)
+	global.params.warnings = 1;
+      break;
+
+    default:
+      /* All other options not handled.  */
+      break;
+    }
+
+  return result;
 }
 
 static void
 d_langhook_parse_file (void)
 {
+  if (!main_input_filename || !main_input_filename[0])
+    {
+      error ("input file name required; cannot use stdin");
+      return;
+    }
+
+  /* Start the main input file, if the debug writer wants it.  */
+  if (debug_hooks->start_end_main_source_file)
+    (*debug_hooks->start_source_file) (0, main_input_filename);
+
+  d_frontend_parse_file (in_fnames, num_in_fnames);
+
+  /* And end the main input file, if the debug writer wants it.  */
+  if (debug_hooks->start_end_main_source_file)
+    (*debug_hooks->end_source_file) (0);
 }
 
 static tree
@@ -197,6 +363,15 @@ d_langhook_write_globals (void)
 
 #undef LANG_HOOKS_INIT
 #define LANG_HOOKS_INIT		d_langhook_init
+
+#undef LANG_HOOKS_OPTION_LANG_MASK
+#define LANG_HOOKS_OPTION_LANG_MASK	d_langhook_option_lang_mask
+
+#undef LANG_HOOKS_INIT_OPTIONS
+#define LANG_HOOKS_INIT_OPTIONS		d_langhook_init_options
+
+#undef LANG_HOOKS_HANDLE_OPTION
+#define LANG_HOOKS_HANDLE_OPTION	d_langhook_handle_option
 
 #undef LANG_HOOKS_PARSE_FILE
 #define LANG_HOOKS_PARSE_FILE		d_langhook_parse_file
